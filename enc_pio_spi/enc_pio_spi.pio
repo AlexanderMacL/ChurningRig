@@ -1,0 +1,136 @@
+.program enc_pio_counter
+.side_set 1 opt
+.origin 0        ; The jump table has to start at 0
+                 ; it contains the correct jumps for each of the 16  
+                 ; combination of 4 bits formed by A'B'AB
+                 ; A = current reading of pin_A of the rotary encoder
+                 ; A' = previous reading of pin_A of the rotary encoder
+                 ; B = current reading of pin_B of the rotary encoder
+                 ; B' = previous reading of pin_B of the rotary encoder
+    jmp read     ; 0000 = from 00 to 00 = no change in reading
+    jmp CW       ; 0001 = from 00 to 01 = clockwise rotation
+    jmp CCW      ; 0010 = from 00 to 10 = counter clockwise rotation
+    irq 2        ; 0011 = from 00 to 11 = error
+
+    jmp CCW      ; 0100 = from 01 to 00 = counter clockwise rotation
+    jmp read     ; 0101 = from 01 to 01 = no change in reading 
+    irq 2        ; 0110 = from 01 to 10 = error
+    jmp CW       ; 0111 = from 01 to 11 = clockwise rotation
+ 
+    jmp CW       ; 1000 = from 10 to 00 = clockwise rotation
+    irq 2        ; 1001 = from 10 to 01 = error
+    jmp read     ; 1010 = from 10 to 10 = no change in reading 
+    jmp CCW      ; 1011 = from 10 to 11 = counter clockwise rotation
+ 
+    irq 2        ; 1100 = from 11 to 00 = error
+    jmp CCW      ; 1101 = from 11 to 01 = counter clockwise rotation
+    jmp CW       ; 1110 = from 11 to 10 = clockwise rotation
+    jmp read     ; 1111 = from 11 to 11 = no change in reading 
+
+.wrap_target
+pc_start:        ; this is the entry point for the program
+    in pins 2    ; read the current values of A and B and use 
+                 ; them to initialize the previous values (A'B')
+read:
+    jmp pin shiftout;
+    mov OSR ISR  ; the OSR is (after the next instruction) used to shift 
+                 ; the two bits with the previous values into the ISR
+    out ISR 2    ; shift the previous value into the ISR. This also sets
+                 ; all other bits in the ISR to 0
+    in pins 2    ; shift the current value into the ISR
+                 ; the 16 LSB of the ISR now contain 000000000000A'B'AB
+                 ; this represents a jmp instruction to the address A'B'AB 
+    mov exec ISR ; do the jmp encoded in the ISR
+CW:              ; a clockwise rotation was detected
+    irq 0        ; signal a clockwise rotation via an IRQ
+    jmp X-- read ; jump to reading the current values of A and B
+CCW:             ; a counter clockwise rotation was detected
+    irq 1        ; signal a counter clockwise rotation via an IRQ
+    jmp X-- read ; jump to reading the current values of A and B.
+
+shiftout:
+    mov ISR ~X   ; count is ~X
+    push noblock side 0
+    mov X ~Y     ; Y should be set to 0 in initialisation
+.wrap
+
+
+.program enc_pio_metronome
+.side_set 1 opt
+                        ; 3 instructions
+dal_segno:
+    MOV X, OSR          ; copy wait cycles to X
+repeat:
+    JMP X-- repeat      ; decrement X
+    JMP dal_segno SIDE 1; when loop is exhausted, loop, and assert metronome pin
+
+
+
+
+
+// start:
+//     wait 0 pin 0        ; Stall until start bit is asserted
+//     set x, 7    [10]    ; Preload bit counter, then delay until halfway through
+// bitloop:                ; the first data bit (12 cycles incl wait, set).
+//     in pins, 1          ; Shift data bit into ISR
+//     jmp x-- bitloop [6] ; Loop 8 times, each loop iteration is 8 cycles
+//     jmp pin good_stop   ; Check stop bit (should be high)
+
+//     irq 4 rel           ; Either a framing error or a break. Set a sticky flag,
+//     wait 1 pin 0        ; and wait for line to return to idle state.
+//     jmp start           ; Don't push data if we didn't see good framing.
+
+// good_stop:              ; No delay before returning to start; a little slack is
+//     push                ; important in case the TX clock is slightly too fast.
+
+
+% c-sdk {
+#include "pico/stdlib.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void enc_pio_counter_init(PIO pio, uint sm, uint offset, uint encpin, uint irpin) {
+
+    pio_gpio_init(pio, encpin);
+    pio_gpio_init(pio, encpin+1);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, encpin, 2, false); // input
+
+    pio_sm_config c = enc_pio_counter_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, encpin);
+    sm_config_set_jmp_pin (&c, irpin);
+    sm_config_set_sideset_pins(&c, irpin);
+    sm_config_set_in_shift(&c, false, false, 0);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    
+    pio_sm_init(pio, sm, 16, &c);
+    pio_sm_set_enabled(pio, sm, true);
+
+    pio_sm_exec(pio, sm, 0b1110000001000000); // set Y to 0
+
+    //pio->inte0 = PIO_IRQ0_INTE_SM0_BITS << sm; // set up interrupt for sm on PIO0_IRQ_0
+    //pio->intr |= 0x100 << sm;
+}
+
+static inline void enc_pio_metronome_change_rate(PIO pio, uint sm, uint freq) {
+    pio_sm_put(pio, sm, clock_get_hz(clk_sys) / freq - 2); // the minus 2 is to compensate for loop-intermediate MOV and JMP commands
+    pio_sm_exec(pio, sm, 0b1000000010000000);
+}
+
+static inline void enc_pio_metronome_init(PIO pio, uint sm, uint offset, uint irpin, uint freq) {
+
+    pio_gpio_init(pio, irpin);
+    pio_sm_set_consecutive_pindirs(pio, sm, irpin, 1, true); // output
+
+    pio_sm_config c = enc_pio_metronome_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, irpin);
+
+    // pio->inte0 = 0x100 << sm; // set up interrupt for sm on PIO0_IRQ_0
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+    
+    enc_pio_metronome_change_rate(pio, sm, freq);
+}
+
+%}
